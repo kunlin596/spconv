@@ -19,7 +19,7 @@ from cumm.gemm.algospec.core import TensorOp
 from cumm.conv.main import gen_gemm_params as gen_conv_params, ConvFwdAndBwdInput, ConvBwdWeight, ConvIterAlgo, GemmAlgo
 from cumm.conv.bases import (NCHW, NHWC, ConvIterAlgo, ConvLayout,
                              ConvLayoutType, ConvMode, ConvOpType)
-from spconv.constants import NDIM_DONT_CARE, SPCONV_INT8_DEBUG
+from spconv.constants import NDIM_DONT_CARE, SPCONV_INT8_DEBUG, SPCONV_ADD_BF16
 
 
 class ConvAlgo(Enum):
@@ -37,6 +37,13 @@ class AlgoHint(Enum):
 
 # we can't add more kernels here because build in github action is very slow.
 # TODO two step build: build gemm kernels first, then bind for every python
+
+
+# kun/feat/bf16: bf16 tensor ops are sm_80+ only -> bf16 kernels are emitted solely
+# in the Ampere ImplGemm groups below, always with f32 accumulators (gradient
+# numerics). Reference: upstream feature/bf16 commit a717f0d, which also injected
+# SIMT/Volta/Turing groups (no bf16 mma pre-sm_80 -> cannot work) - not repeated here.
+_BF16_DTYPES_F32_ACC_AMPERE = ["bf16,bf16,bf16,f32,f32"] if SPCONV_ADD_BF16 else []
 
 SHUFFLE_SIMT_PARAMS: List[GemmAlgoParams] = [
     # *gen_shuffle_params((64, 128, 32), (32, 64, 32), ["s8,s8,s8,s32,s32"], "",
@@ -542,7 +549,7 @@ IMPLGEMM_AMPERE_PARAMS = [
     *gen_conv_params(ConvFwdAndBwdInput, (64, 128, 32), (32, 64, 32),
                      NDIM_DONT_CARE,
                      ConvIterAlgo.Optimized,
-                     [2, 3, 4], ["f16,f16,f16,f16,f16", "f16,f16,f16,f32,f32"],
+                     [2, 3, 4], ["f16,f16,f16,f16,f16", *_BF16_DTYPES_F32_ACC_AMPERE, "f16,f16,f16,f32,f32"],
                      NHWC,
                      NHWC,
                      NHWC,
@@ -555,7 +562,7 @@ IMPLGEMM_AMPERE_PARAMS = [
     *gen_conv_params(ConvFwdAndBwdInput, (64, 64, 32), (32, 32, 32),
                      NDIM_DONT_CARE,
                      ConvIterAlgo.Optimized,
-                     [2, 3, 4], ["f16,f16,f16,f16,f16", "f16,f16,f16,f32,f32"],
+                     [2, 3, 4], ["f16,f16,f16,f16,f16", *_BF16_DTYPES_F32_ACC_AMPERE, "f16,f16,f16,f32,f32"],
                      NHWC,
                      NHWC,
                      NHWC,
@@ -568,7 +575,7 @@ IMPLGEMM_AMPERE_PARAMS = [
     *gen_conv_params(ConvFwdAndBwdInput, (128, 64, 32), (64, 32, 32),
                      NDIM_DONT_CARE,
                      ConvIterAlgo.Optimized,
-                     [2, 3, 4], ["f16,f16,f16,f16,f16", "f16,f16,f16,f32,f32"],
+                     [2, 3, 4], ["f16,f16,f16,f16,f16", *_BF16_DTYPES_F32_ACC_AMPERE, "f16,f16,f16,f32,f32"],
                      NHWC,
                      NHWC,
                      NHWC,
@@ -596,7 +603,7 @@ IMPLGEMM_AMPERE_PARAMS = [
                      NDIM_DONT_CARE,
                      ConvIterAlgo.Optimized,
                      [2, 3, 4],
-                     "f16,f16,f16,f32,f32",
+                     [*_BF16_DTYPES_F32_ACC_AMPERE, "f16,f16,f16,f32,f32"],
                      NHWC,
                      NHWC,
                      NHWC,
@@ -610,7 +617,7 @@ IMPLGEMM_AMPERE_PARAMS = [
                      NDIM_DONT_CARE,
                      ConvIterAlgo.Optimized,
                      [2, 3, 4, 5],
-                     "f16,f16,f16,f32,f32",
+                     [*_BF16_DTYPES_F32_ACC_AMPERE, "f16,f16,f16,f32,f32"],
                      NHWC,
                      NHWC,
                      NHWC,

@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import collections.abc
+import functools
 import sys
 import pickle
 
@@ -56,9 +58,57 @@ else:
     _TORCH_CUSTOM_BWD = identity_decorator
 
 
+
+
+# --- kun/feat/bf16: autocast-aware forward decorator ------------------------
+# Stock _TORCH_CUSTOM_FWD force-casts inputs to fp16 under autocast. With bf16
+# kernels available, the conv Functions must instead honor the ACTIVE autocast
+# dtype (bf16 stays bf16), mirroring upstream feature/bf16 (a717f0d) on
+# torch>=2.x APIs only.
+
+def _cast(value, dtype):
+    """Recursively cast eligible CUDA float tensors in containers to dtype."""
+    if isinstance(value, torch.Tensor):
+        is_eligible = (value.is_floating_point() and value.is_cuda
+                       and value.dtype is not torch.float64)
+        return value.to(dtype) if is_eligible else value
+    if isinstance(value, collections.abc.Mapping):
+        return {_cast(k, dtype): _cast(v, dtype) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return type(value)(_cast(v, dtype) for v in value)
+    return value
+
+
+def _is_autocast_enabled():
+    if PYTORCH_VERSION >= [2, 4, 0]:
+        return torch.is_autocast_enabled("cuda")
+    return torch.is_autocast_enabled()
+
+
+def _current_autocast_dtype():
+    if PYTORCH_VERSION >= [2, 4, 0]:
+        return torch.get_autocast_dtype("cuda")
+    return torch.get_autocast_gpu_dtype()
+
+
+def custom_fwd_autocast_aware(fwd):
+    """Run fwd with autocast disabled, args cast to the dtype that WAS active."""
+
+    @functools.wraps(fwd)
+    def decorate_fwd(*args, **kwargs):
+        if _is_autocast_enabled():
+            dtype = _current_autocast_dtype()
+            with torch.amp.autocast("cuda", enabled=False):
+                return fwd(*_cast(args, dtype), **_cast(kwargs, dtype))
+        return fwd(*args, **kwargs)
+
+    return decorate_fwd
+# -----------------------------------------------------------------------------
+
+
 class SparseConvFunction(Function):
     @staticmethod
-    @_TORCH_CUSTOM_FWD
+    @custom_fwd_autocast_aware
     def forward(ctx,
                 features,
                 filters,
@@ -123,7 +173,7 @@ class SparseConvFunction(Function):
 
 class SparseInverseConvFunction(Function):
     @staticmethod
-    @_TORCH_CUSTOM_FWD
+    @custom_fwd_autocast_aware
     def forward(ctx,
                 features,
                 filters,
@@ -190,7 +240,7 @@ class SparseInverseConvFunction(Function):
 
 class SparseImplicitGemmFunction(Function):
     @staticmethod
-    @_TORCH_CUSTOM_FWD
+    @custom_fwd_autocast_aware
     def forward(ctx,
                 features: torch.Tensor,
                 filters: torch.Tensor,
@@ -292,7 +342,7 @@ class SparseImplicitGemmFunction(Function):
 
 class SubMConvFunction(Function):
     @staticmethod
-    @_TORCH_CUSTOM_FWD
+    @custom_fwd_autocast_aware
     def forward(ctx,
                 features,
                 filters,

@@ -43,6 +43,9 @@ ALL_WEIGHT_IS_KRSC = True
 
 SPCONV_DEBUG_SAVE_PATH = os.getenv("SPCONV_DEBUG_SAVE_PATH", "")
 
+# kun/feat/bf16: emit bf16 (f32-accumulator) Ampere ImplGemm kernels.
+SPCONV_ADD_BF16 = os.getenv("SPCONV_ADD_BF16", "1") == "1"
+
 
 _BOOST_ROOT = os.getenv("BOOST_ROOT", None)
 
