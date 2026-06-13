@@ -1,0 +1,33 @@
+# Pre-commit configuration for the bf16 spconv fork.
+#
+# - Python is formatted with yapf to match format_all.sh (NOT black).
+# - Commit messages must follow Conventional Commits: type(scope): subject
+#   (scope is mandatory by project convention, e.g. feat(bf16): ...).
+#
+# Setup:  pip install pre-commit && pre-commit install --install-hooks
+default_install_hook_types: [pre-commit, commit-msg]
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: ["--maxkb=1024"]
+      - id: mixed-line-ending
+
+  - repo: https://github.com/google/yapf
+    rev: v0.43.0
+    hooks:
+      - id: yapf
+        name: yapf (spconv/test/example/scripts)
+        files: ^(spconv|test|example|scripts)/.*\.py$
+
+  - repo: https://github.com/compilerla/conventional-pre-commit
+    rev: v4.4.0
+    hooks:
+      - id: conventional-pre-commit
+        stages: [commit-msg]

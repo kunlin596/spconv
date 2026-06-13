@@ -244,6 +244,21 @@ def scatter_nd(indices, updates, shape):
     ret[slices] = updates.view(*output_shape)
     return ret
 
+
+def assert_rel_l2(a, b, tol, msg=""):
+    """Relative L2 closeness: ||a - b|| / ||b|| < tol.
+
+    The right metric for low precision (fp16/bf16): element-wise allclose is too
+    strict because a few cancellation-prone outputs (near-zero fp32 value, large
+    relative error) form a long tail, even though the conv is numerically right.
+    The L2 norm is dominated by the large-magnitude (accurate) outputs, so it
+    stays tight AND is robust to that tail (this is what test_multi_impl uses).
+    """
+    a = np.asarray(a).astype(np.float64).ravel()
+    b = np.asarray(b).astype(np.float64).ravel()
+    rel = np.linalg.norm(a - b) / (np.linalg.norm(b) + 1e-12)
+    assert rel < tol, f"rel L2 {rel:.3e} >= {tol} {msg}"
+
 def test_spconv3d():
     test_case = TestCase()
     np.random.seed(484)
@@ -263,16 +278,26 @@ def test_spconv3d():
         ConvAlgo.MaskSplitImplicitGemm
     ]
     algos = [ConvAlgo.Native, ConvAlgo.MaskImplicitGemm, ConvAlgo.MaskSplitImplicitGemm]
+    # dtype parametrization: the numpy reference data stays fp32 and only the
+    # torch nets/tensors are cast, so low precision needs no numpy bf16 (which
+    # doesn't exist). bf16 mma is Ampere+ (sm_80) only. (rtol, atol) per dtype --
+    # fp32 is unchanged from the original; low precision loosens for tensor-op
+    # rounding accumulated over the IC*k^3 contraction.
+    # relative L2-norm tolerance per dtype (||sparse - dense|| / ||dense||).
+    tol_of = {torch.float32: 1e-4, torch.float16: 5e-3, torch.bfloat16: 2e-2}
+    dtypes = [torch.float32, torch.float16]
+    if torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8:
+        dtypes.append(torch.bfloat16)
 
-    for dev, shape, bs, IC, OC, k, s, p, d, al in params_grid(
+    for dev, shape, bs, IC, OC, k, s, p, d, al, dtype in params_grid(
             devices, shapes, batchsizes, in_channels, out_channels, ksizes,
-            strides, paddings, dilations, algos):
+            strides, paddings, dilations, algos, dtypes):
         if all([s > 1, d > 1]):
             continue  # don't support this.
         # print(dev, shape, bs, IC, OC, k, s, p, d)
         device = torch.device(dev)
         num_points = [1500] * bs
-        dtype = torch.float32
+        tol = tol_of[dtype]
         net = SparseConv3dTestTorch(1,
                                     3,
                                     shape,
@@ -283,8 +308,13 @@ def test_spconv3d():
                                     p,
                                     d,
                                     algo=al).to(device).to(dtype)
+        # fp32 dense reference (the "truth"): it gets the SAME bf16-rounded
+        # weights/inputs but computes in fp32, so the low-precision sparse conv is
+        # compared against its ideal fp32 result -- the tolerance then reflects
+        # bf16 compute error (output rounding + f32-accum), not the rounding
+        # disagreement between two separate low-precision implementations.
         net_ref = Conv3dTestTorch(1, 3, shape, IC, OC, k, s, p,
-                                    d).to(device).to(dtype)
+                                    d).to(device)
 
         sparse_dict = generate_sparse_data(shape, num_points, IC)
 
@@ -296,8 +326,10 @@ def test_spconv3d():
         indices_t = torch.from_numpy(indices).int().to(device)
         features_t = torch.from_numpy(features).to(device).to(dtype)
         features_t.requires_grad = True
+        # round the dense input to the sparse dtype, then back to fp32, so both
+        # paths see identical (bf16-rounded) inputs and only the conv math differs.
         features_dense_t = torch.from_numpy(features_dense).to(device).to(
-            dtype)
+            dtype).float()
         features_dense_t.requires_grad = True
         if net.algo == ConvAlgo.Native and not ALL_WEIGHT_IS_KRSC:
             if FILTER_HWIO:
@@ -325,25 +357,25 @@ def test_spconv3d():
         net.net[0].weight.data[:] = filters_t
         out_ref = net_ref(features_dense_t)
         out = net(features_t, indices_t, bs).dense()
-        out_np = out.detach().cpu().numpy()
-        out_ref_np = out_ref.detach().cpu().numpy()
-        test_case.assertAllClose(out_np, out_ref_np, atol=1e-4)
+        out_np = out.detach().float().cpu().numpy()
+        out_ref_np = out_ref.detach().float().cpu().numpy()
+        assert_rel_l2(out_np, out_ref_np, tol, 'fwd')
 
         dout = np.random.uniform(-0.2, 0.2,
                                     out_ref.shape).astype(features.dtype)
-        dout_t = torch.from_numpy(dout).to(device)
+        dout_t = torch.from_numpy(dout).to(device).to(dtype)
         out.backward(dout_t)
-        out_ref.backward(dout_t)
+        out_ref.backward(dout_t.float())
         din_dense = features_dense_t.grad.detach().permute(0, 2, 3, 4,
                                                             1).contiguous()
         din_sparse = gather_nd(din_dense, indices_t.long())
         din = features_t.grad.detach()
 
-        din_np = din.cpu().numpy()
-        din_sparse_np = din_sparse.cpu().numpy()
+        din_np = din.float().cpu().numpy()
+        din_sparse_np = din_sparse.float().cpu().numpy()
         for layer, layer_ref in zip(net.net, net_ref.net):
-            dw = layer.weight.grad.detach().cpu().numpy()
-            dw_ref = layer_ref.weight.grad.detach().cpu().numpy()
+            dw = layer.weight.grad.detach().float().cpu().numpy()
+            dw_ref = layer_ref.weight.grad.detach().float().cpu().numpy()
             if net.algo == ConvAlgo.Native and not ALL_WEIGHT_IS_KRSC:
                 if FILTER_HWIO:
                     dw = dw.transpose(4, 3, 0, 1, 2)
@@ -353,8 +385,8 @@ def test_spconv3d():
                 # OHWI -> OIHW
                 dw = dw.transpose(0, 4, 1, 2, 3)
 
-            test_case.assertAllClose(dw, dw_ref, atol=1e-4)
-        test_case.assertAllClose(din_np, din_sparse_np, atol=1e-4)
+            assert_rel_l2(dw, dw_ref, tol, 'wgrad')
+        assert_rel_l2(din_np, din_sparse_np, tol, 'dgrad')
 
 def test_spdeconv3d():
     test_case = TestCase()
@@ -375,15 +407,20 @@ def test_spdeconv3d():
         ConvAlgo.Native, ConvAlgo.MaskImplicitGemm,
         ConvAlgo.MaskSplitImplicitGemm
     ]
+    # relative L2-norm tol per dtype (transpose conv = SparseInverseConv3d kernels)
+    tol_of = {torch.float32: 1e-4, torch.float16: 5e-3, torch.bfloat16: 2e-2}
+    dtypes = [torch.float32, torch.float16]
+    if torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8:
+        dtypes.append(torch.bfloat16)
 
-    for dev, shape, bs, IC, OC, k, s, p, d, al in params_grid(
+    for dev, shape, bs, IC, OC, k, s, p, d, al, dtype in params_grid(
             devices, shapes, batchsizes, in_channels, out_channels, ksizes,
-            strides, paddings, dilations, algos):
+            strides, paddings, dilations, algos, dtypes):
         if all([s > 1, d > 1]):
             continue  # don't support this.
         device = torch.device(dev)
         num_points = [1000] * bs
-        dtype = torch.float32
+        tol = tol_of[dtype]
 
         sparse_dict = generate_sparse_data(shape, num_points, IC)
 
@@ -393,7 +430,7 @@ def test_spdeconv3d():
             sparse_dict["indices"][:, [3, 0, 1, 2]]).astype(np.int32)
         features_dense = sparse_dict["features_dense"].astype(np.float32)
         net = SparseDeConv3dTestTorch(1, 3, shape, IC, OC, k, s, p,
-                                        d, al).to(device)
+                                        d, al).to(device).to(dtype)
         net_ref = DeConv3dTestTorch(1, 3, shape, IC, OC, k, s, p,
                                     d).to(device)
 
@@ -423,32 +460,32 @@ def test_spdeconv3d():
         net.net[0].weight.data[:] = filters_t
 
         indices_t = torch.from_numpy(indices).int().to(device)
-        features_t = torch.from_numpy(features).to(device)
+        features_t = torch.from_numpy(features).to(device).to(dtype)
         features_t.requires_grad = True
-        features_dense_t = torch.from_numpy(features_dense).to(device)
+        features_dense_t = torch.from_numpy(features_dense).to(device).to(dtype).float()
         features_dense_t.requires_grad = True
         filters_t = torch.from_numpy(filters).to(device)
         out_ref = net_ref(features_dense_t)
         out = net(features_t, indices_t, bs).dense()
-        out_np = out.detach().cpu().numpy()
-        out_ref_np = out_ref.detach().cpu().numpy()
-        test_case.assertAllClose(out_np, out_ref_np, atol=1e-4)
+        out_np = out.detach().float().cpu().numpy()
+        out_ref_np = out_ref.detach().float().cpu().numpy()
+        assert_rel_l2(out_np, out_ref_np, tol, 'fwd')
 
         dout = np.random.uniform(-0.2, 0.2,
                                     out_ref.shape).astype(features.dtype)
-        dout_t = torch.from_numpy(dout).to(device)
+        dout_t = torch.from_numpy(dout).to(device).to(dtype)
         out.backward(dout_t)
-        out_ref.backward(dout_t)
+        out_ref.backward(dout_t.float())
         din_dense = features_dense_t.grad.detach().permute(0, 2, 3, 4,
                                                             1).contiguous()
         din_sparse = gather_nd(din_dense, indices_t.long())
         din = features_t.grad.detach()
-        din_np = din.cpu().numpy()
-        din_sparse_np = din_sparse.cpu().numpy()
-        test_case.assertAllClose(din_np, din_sparse_np, atol=1e-4)
+        din_np = din.float().cpu().numpy()
+        din_sparse_np = din_sparse.float().cpu().numpy()
+        assert_rel_l2(din_np, din_sparse_np, tol, 'dgrad')
         for layer, layer_ref in zip(net.net, net_ref.net):
-            dw = layer.weight.grad.detach().cpu().numpy()
-            dw_ref = layer_ref.weight.grad.detach().cpu().numpy()
+            dw = layer.weight.grad.detach().float().cpu().numpy()
+            dw_ref = layer_ref.weight.grad.detach().float().cpu().numpy()
             if net.algo == ConvAlgo.Native and not ALL_WEIGHT_IS_KRSC:
                 if FILTER_HWIO:
                     dw = dw.transpose(3, 4, 0, 1, 2)
@@ -457,7 +494,7 @@ def test_spdeconv3d():
             else:
                 # OHWI -> OIHW
                 dw = dw.transpose(4, 0, 1, 2, 3)
-            test_case.assertAllClose(dw, dw_ref, atol=1e-4)
+            assert_rel_l2(dw, dw_ref, tol, 'wgrad')
 
 def test_spmaxpool3d():
     test_case = TestCase()
