@@ -96,6 +96,13 @@ def custom_fwd_autocast_aware(fwd):
 
     @functools.wraps(fwd)
     def decorate_fwd(*args, **kwargs):
+        # This wrapper replaces torch's amp.custom_fwd, but the paired backward
+        # still uses amp.custom_bwd, which reads ctx._fwd_used_autocast and
+        # ctx._dtype. The real fwd always runs with autocast DISABLED (inputs are
+        # cast explicitly below), so flag autocast unused and record the dtype --
+        # without these the backward raises AttributeError on ctx._fwd_used_autocast.
+        args[0]._fwd_used_autocast = False
+        args[0]._dtype = _current_autocast_dtype()
         if _is_autocast_enabled():
             dtype = _current_autocast_dtype()
             with torch.amp.autocast("cuda", enabled=False):

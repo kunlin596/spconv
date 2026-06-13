@@ -18,4 +18,4 @@ from .core import ConvAlgo, AlgoHint
 from . import constants
 from .__version__ import __version__
 
-SPCONV_VERSION_NUMBERS = list(map(int, __version__.split(".")))
+SPCONV_VERSION_NUMBERS = list(map(int, __version__.split("+")[0].split(".")))

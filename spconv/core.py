@@ -44,6 +44,10 @@ class AlgoHint(Enum):
 # numerics). Reference: upstream feature/bf16 commit a717f0d, which also injected
 # SIMT/Volta/Turing groups (no bf16 mma pre-sm_80 -> cannot work) - not repeated here.
 _BF16_DTYPES_F32_ACC_AMPERE = ["bf16,bf16,bf16,f32,f32"] if SPCONV_ADD_BF16 else []
+# kun/feat/bf16: the NATIVE (shuffle) GEMM path used by strided SparseConv3d /
+# SparseInverseConv3d takes a dtype list AND a separate ShuffleAB ("sab") dtype
+# string. Same bf16 in/out with f32 accumulators as the ImplGemm groups above.
+_BF16_GEMM_STR = "bf16,bf16,bf16,f32,f32"
 
 SHUFFLE_SIMT_PARAMS: List[GemmAlgoParams] = [
     # *gen_shuffle_params((64, 128, 32), (32, 64, 32), ["s8,s8,s8,s32,s32"], "",
@@ -195,16 +199,32 @@ SHUFFLE_TURING_PARAMS: List[GemmAlgoParams] = [
     #                     2, kernel.GemmAlgo.Turing, TensorOp((8, 8, 16))),
 ]
 
-SHUFFLE_AMPERE_PARAMS = [
-    # *gen_shuffle_params(
-    #     (128, 128, 64),
-    #     (64, 64, 64), ["s8,s8,s8,s32,s32"], "", 3, kernel.GemmAlgo.Ampere,
-    #     TensorOp((8, 8, 16))),
-    # *gen_shuffle_params(
-    #     (128, 64, 64),
-    #     (64, 32, 64), ["s8,s8,s8,s32,s32"], "", 3, kernel.GemmAlgo.Ampere,
-    #     TensorOp((8, 8, 16))),
-]
+SHUFFLE_AMPERE_PARAMS: List[GemmAlgoParams] = [
+    # kun/feat/bf16: Ampere bf16 (f32-acc) TensorOp shuffle kernels for the NATIVE
+    # conv path (strided SparseConv3d / SparseInverseConv3d, algo=ConvAlgo.Native).
+    # These gather->GEMM->scatter through a SEPARATE tuner (ALL_NATIVE_PARAMS) that
+    # the Ampere ImplGemm bf16 groups never reach, so a full-bf16 U-Net otherwise
+    # dies at the first downsample with "can't find suitable algorithm". Mirror the
+    # eight SHUFFLE_TURING_PARAMS f16 tiles as GemmAlgo.Ampere + bf16; bf16 mma is
+    # sm_80+ and accumulates in f32 (no bf16-accumulator tensor op).
+    *(
+        p
+        for ts, wts in (
+            ((64, 64, 32), (32, 32, 32)),
+            ((128, 128, 32), (32, 64, 32)),
+            ((64, 64, 64), (32, 32, 32)),
+            ((64, 128, 64), (32, 64, 32)),
+            ((128, 256, 32), (64, 64, 32)),
+            ((256, 128, 32), (64, 64, 32)),
+            ((128, 64, 32), (64, 32, 32)),
+            ((64, 128, 32), (32, 64, 32)),
+        )
+        for p in gen_shuffle_params(
+            ts, wts, [_BF16_GEMM_STR], _BF16_GEMM_STR, 2,
+            kernel.GemmAlgo.Ampere, TensorOp((16, 8, 8))
+        )
+    ),
+] if SPCONV_ADD_BF16 else []
 
 # SHUFFLE_TURING_PARAMS = []
 # here we must use f32 for simt f16 accumulators because
